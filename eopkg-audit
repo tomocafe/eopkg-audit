@@ -95,7 +95,7 @@ def audit(args, config):
                     print "%s %s" % (colorize("+", 'green'), filepath)
         elif os.path.exists(sysdir):
             print "%s %s" % (colorize("*", 'lightblue'), os.path.join(filepath, ''))
-        elif not args.deleted:
+        elif not args.added:
             print "%s %s" % (colorize("-", 'red'), os.path.join(filepath, ''))
     # Report missing permissions
     if perm_ct:
