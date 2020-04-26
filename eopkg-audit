@@ -1,0 +1,154 @@
+#!/usr/bin/python
+
+# Refer to README.md
+# Run eopkg-audit --help for usage
+
+import os
+import re
+import sys
+import argparse
+import json
+
+import pisi.util as util
+import pisi.context as ctx
+import pisi.db.installdb
+
+from collections import defaultdict 
+
+def colorize(text, color):
+    # This should actually be done inside pisi.util.colorize
+    if sys.stdout.isatty():
+        return util.colorize(text, color)
+    else:
+        return text
+
+def is_under_path(path, path_list):
+    if os.path.isdir(path) and not path.endswith(os.sep):
+        path += os.sep
+    for p in path_list:
+        if path.startswith(p):
+            return True
+    return False
+
+def matches_pattern(path, re_list):
+    for regex in re_list:
+        if regex.findall(path):
+            return True
+    return False
+
+lib_regex = re.compile(r'lib\w+\.so')
+def is_special_ignore(path):
+    # Symbolic links to system libraries are not tracked by eopkg
+    if lib_regex.findall(path) and os.path.islink(path):
+        return True
+    return False
+
+def audit(args, config):
+    installdb = pisi.db.installdb.InstallDB()
+    # Precompile regexes
+    ignore_regexes = []
+    if config['ignore_pattern']:
+        ignore_regexes = [re.compile(regex) for regex in config['ignore_pattern']]
+    syslibdir_regex = re.compile(r'^(|/usr)/lib64(/|$)')
+    # Collect a dict of system directories and their contained files recorded in the PISI (eopkg) database
+    sysfiles = defaultdict(list)
+    for pkg in installdb.list_installed():
+        files_xml = open(os.path.join(installdb.package_path(pkg), ctx.const.files_xml)).read()
+        paths = re.compile('<Path>(.*)</Path>').findall(files_xml) # TODO: use a proper xml parser?
+        for path in paths:
+            file = os.sep + path
+            sysdir = os.path.dirname(file)
+            file = os.path.basename(file)
+            sysdir = syslibdir_regex.sub(r'\1/lib\2', sysdir) # Solus: lib -> lib64
+            # Filter out some directories from the dict
+            if args.paths and not is_under_path(sysdir, args.paths):
+                continue
+            if config['ignore'] and is_under_path(sysdir, config['ignore']):
+                continue
+            sysfiles[sysdir].append(file)
+    # Walk the system directories and look for discrepancies with the record
+    perm_ct = 0
+    for sysdir, files in sysfiles.items():
+        if not os.access(sysdir, os.R_OK):
+            perm_ct += 1
+            continue
+        if os.path.isdir(sysdir):
+            filect = defaultdict(int)
+            for file in files:
+                if not os.path.isdir(os.path.join(sysdir, file)):
+                    filect[file] -= 1
+            for file in os.listdir(sysdir):
+                if not os.path.isdir(os.path.join(sysdir, file)):
+                    filect[file] += 1
+            for file, ct in filect.items():
+                filepath = os.path.join(sysdir, file)
+                # Filter out some files from reporting
+                if config['ignore'] and is_under_path(filepath, config['ignore']):
+                    continue
+                if ignore_regexes and matches_pattern(filepath, ignore_regexes):
+                    continue
+                if is_special_ignore(filepath):
+                    continue
+                if ct < 0 and not args.added:
+                    print "%s %s" % (colorize("-", 'red'), filepath)
+                elif ct > 0 and not args.deleted:
+                    print "%s %s" % (colorize("+", 'green'), filepath)
+        elif os.path.exists(sysdir):
+            print "%s %s" % (colorize("*", 'lightblue'), os.path.join(filepath, ''))
+        elif not args.deleted:
+            print "%s %s" % (colorize("-", 'red'), os.path.join(filepath, ''))
+    # Report missing permissions
+    if perm_ct:
+        print "Skipped %d director%s due to lack of permission" % (perm_ct, 'y' if perm_ct == 1 else 'ies')
+        print "Run with sudo to audit th%s director%s" % ('is' if perm_ct == 1 else 'ese', 'y' if perm_ct == 1 else 'ies')
+
+def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Audits system files against the eopkg database, showing files that have been manually added or deleted in any directory eopkg has installed to.', epilog="""
+        A configuration file can be specified by argument or will automatically be read from ~/.config/eopkg-audit/config.json. Use the --dump-config switch to dump the default configuration, save it to the default config location, and modify as needed. The configuration file should consist of a JSON dict with the following key-value pairs. 'ignore': list of paths; 'ignore_pattern': list of patterns
+    """)
+    parser.add_argument('-a', '--added', action='store_true', help='show only system files that are added outside of eopkg')
+    parser.add_argument('-d', '--deleted', action='store_true', help='show only system files that are deleted outside of eopkg')
+    parser.add_argument('-c', '--config', type=str, help='path to optional configuration file')
+    parser.add_argument('-i', '--ignore', metavar='PATH', action='append', help='path to a file or directory to ignore (may be given multiple times; if a directory is given, all files and subdirectories beneath it will be ignored)')
+    parser.add_argument('-I', '--ignore-pattern', metavar='PATTERN', action='append', help='regular expression pattern to ignore matches')
+    parser.add_argument('--dump-config', action='store_true', help='dump the default config JSON (useful for writing your own config file)')
+    parser.add_argument('paths', type=str, nargs='*', help='list of directories to search')
+    args = parser.parse_args()
+    # Build default config dict
+    config = {
+        'ignore': [
+            '/etc/',
+            '/run/',
+            '/var/',
+            '/usr/lib/kernel/',
+            '/usr/lib/systemd/system/',
+            '/usr/lib/sysusers.d/',
+            '/usr/lib/python2.7/site-packages/',
+            '/usr/lib/python3.7/site-packages/',
+            '/usr/lib/ruby/gems/',
+            '/usr/lib/firefox/'
+        ],
+        'ignore_pattern': [
+            '\.pyc$',
+            '/\.uuid$',
+            'icon-theme.cache$'
+        ]
+    }
+    if args.dump_config:
+        print json.dumps(config, indent=4)
+        sys.exit(0)
+    # Load config file if specified or exists in default location
+    config_file = args.config if args.config else os.path.expanduser('~/.config/eopkg-audit/config.json')
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as fd:
+            config = json.load(fd)
+    if args.ignore:
+        config['ignore'].extend(args.ignore)
+    if args.ignore_pattern:
+        config['ignore_pattern'].extend(args.ignore_pattern)
+    # Call the worker function
+    audit(args, config)
+
+if __name__ == '__main__':
+    main()
